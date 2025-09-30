@@ -1,1 +1,204 @@
+Yes—don’t diff against the user’s JSON. After Argo CD writes the VM YAML, you can decide everything just by comparing desired (VM) vs current runtime (VMI) and by looking for the RestartRequired condition.
 
+Here’s the exact, API-only way to do it (works with your oc whoami -t + curl style).
+
+1) Read the desired CPU & memory (from the VM object)
+APISERVER="https://<api>:6443"
+NS="icpwforge"
+VM="vmh02"
+TOKEN="$(oc whoami -t)"
+
+# VM (desired spec)
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachines/$VM" | jq '
+  {
+    desired_cpu: (
+      .spec.template.spec.domain.cpu as $c
+      | ((($c.cores // 1) * ($c.sockets // 1) * ($c.threads // 1)) // 0)
+    ),
+    desired_cpu_topology: .spec.template.spec.domain.cpu,
+    desired_memory: (
+      .spec.template.spec.domain.memory.guest
+      // .spec.template.spec.domain.resources.requests.memory
+    ),
+    restart_required: (
+      [ .status.conditions[]? | select(.type=="RestartRequired" and .status=="True") ] | length > 0
+    )
+  }'
+
+
+vCPU desired = cores * sockets * threads from VM.spec.template.spec.domain.cpu. 
+KubeVirt.io
+
+Memory desired is VM.spec.template.spec.domain.memory.guest (if set) or fall back to resources.requests.memory. 
+KubeVirt.io
++1
+
+If the VM has a condition type: RestartRequired, status: "True", then a reboot is required for pending changes to take effect. 
+KubeVirt.io
+
+2) Read the current CPU & memory (from the VMI object)
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachineinstances/$VM" | jq '
+  {
+    current_cpu: (
+      .status.currentCPUTopology as $t
+      | ((($t.cores // 0) * ($t.sockets // 0) * ($t.threads // 0)) // 0)
+    ),
+    current_cpu_topology: .status.currentCPUTopology,
+    current_memory_guest: .status.memory.guestCurrent,
+    hot_vcpu_change: (
+      [ .status.conditions[]? | select(.type=="HotVCPUChange" and .status=="True") ] | length > 0
+    ),
+    printable_status: .status.printableStatus
+  }'
+
+
+Live, effective CPU is exposed as VMI.status.currentCPUTopology {cores,sockets,threads}; compute the same product to get the current vCPU count. 
+KubeVirt.io
+
+Live, effective memory comes from VMI.status.memory.guestCurrent. 
+KubeVirt.io
+
+While CPU hot-plug is in progress you’ll briefly see the HotVCPUChange condition on the VMI. 
+KubeVirt.io
+
+3) Make the decision
+
+Argo applied? If the VM shows your new values in .spec.template.spec.domain.cpu and/or .spec.template.spec.domain.memory.guest, Argo CD has already written them into the cluster object.
+
+Change already active (no reboot)? The VMI’s currentCPUTopology / status.memory.guestCurrent match the VM desired values.
+
+Reboot required? The VM has status.conditions[type=RestartRequired,status=True] → restart the VM; until then the VMI won’t reflect the new values. 
+KubeVirt.io
+
+That’s it—no need to compare with the original user request. Compare VM (desired) vs VMI (current) and trust the RestartRequired condition to know if you must restart. If you’re using CPU/memory hot-plug with LiveUpdate, you’ll also see the live changes flow into the VMI without a reboot (and you can watch the fields above update during the process). 
+KubeVirt.io
++1
+
+
+-----------------------------------------------------------------------------------------------------------------
+
+Great—now that you can call the API, here’s exactly what each call gives you and how to decide restart or not.
+
+What each API gives you
+
+GET VM (kubevirt.io/v1 …/virtualmachines/<VM>) — this returns:
+
+Desired spec (what you want):
+.spec.template.spec.domain.cpu (cores/sockets/threads)
+.spec.template.spec.domain.memory.guest or .spec.template.spec.domain.resources.requests.memory
+
+Controller status (what KubeVirt thinks):
+.status.conditions[] → look for { "type": "RestartRequired", "status": "True" }
+.status.observedGeneration (has the controller seen latest spec?)
+
+GET VMI (kubevirt.io/v1 …/virtualmachineinstances/<VM>) — this returns runtime/actual:
+
+CPU actually running now: .status.currentCPUTopology.{cores,sockets,threads}
+
+Memory actually in guest now: .status.memory.{guestCurrent, guestRequested, guestAtBoot}
+
+So: VM = desired + restart-required flag. VMI = what’s actually applied right now.
+
+Minimal set of curls (with jq) you can run
+
+Set vars once:
+
+APISERVER="https://api.wh-ngcpntt1.svr.us.jpmchase.net:6443"
+NS="icpwforge"
+VM="vmh02"
+TOKEN="$(oc whoami -t)"
+AUTH="Authorization: Bearer $TOKEN"
+
+A) Has the controller seen your new spec yet?
+curl -k -H "$AUTH" \
+  "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachines/$VM" \
+| jq '{gen:.metadata.generation, obs:.status.observedGeneration, seen:(.metadata.generation==.status.observedGeneration)}'
+
+
+Wait until "seen": true.
+
+B) Is a restart required?
+curl -k -H "$AUTH" \
+  "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachines/$VM" \
+| jq -r '[.status.conditions[]? | select(.type=="RestartRequired")][0].status // "False"'
+
+
+If this prints True → you must restart (no need to compare further).
+
+C) What are the desired CPU & memory?
+curl -k -H "$AUTH" \
+  "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachines/$VM" \
+| jq '{desiredCPU:.spec.template.spec.domain.cpu,
+       desiredMem:(.spec.template.spec.domain.memory.guest // .spec.template.spec.domain.resources.requests.memory)}'
+
+D) What is the actual CPU & memory now (runtime)?
+curl -k -H "$AUTH" \
+  "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachineinstances/$VM" \
+| jq '{actualCPU:.status.currentCPUTopology,
+       actualMem:.status.memory}'
+
+
+Compare:
+
+CPU: desiredCPU vs actualCPU
+
+Memory: desiredMem vs actualMem.guestCurrent
+(also see guestRequested and guestAtBoot for context)
+
+One-shot decision (bash + jq)
+
+This prints one of: RESTART_REQUIRED, LIVE_APPLIED_OK, or STILL_APPLYING:
+
+VMJSON=$(curl -ks -H "$AUTH" "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachines/$VM")
+VMIJSON=$(curl -ks -H "$AUTH" "$APISERVER/apis/kubevirt.io/v1/namespaces/$NS/virtualmachineinstances/$VM")
+
+RR=$(echo "$VMJSON" | jq -r '[.status.conditions[]? | select(.type=="RestartRequired")][0].status // "False"')
+if [ "$RR" = "True" ]; then
+  echo RESTART_REQUIRED
+  exit 0
+fi
+
+# desired
+DES_CORES=$(echo "$VMJSON" | jq -r '.spec.template.spec.domain.cpu.cores // 1')
+DES_SOCKS=$(echo "$VMJSON" | jq -r '.spec.template.spec.domain.cpu.sockets // 1')
+DES_THREADS=$(echo "$VMJSON" | jq -r '.spec.template.spec.domain.cpu.threads // 1')
+DES_MEM=$(echo "$VMJSON" | jq -r '.spec.template.spec.domain.memory.guest // .spec.template.spec.domain.resources.requests.memory')
+
+# actual
+ACT_CORES=$(echo "$VMIJSON" | jq -r '.status.currentCPUTopology.cores // empty')
+ACT_SOCKS=$(echo "$VMIJSON" | jq -r '.status.currentCPUTopology.sockets // empty')
+ACT_THREADS=$(echo "$VMIJSON" | jq -r '.status.currentCPUTopology.threads // empty')
+ACT_MEM=$(echo "$VMIJSON" | jq -r '.status.memory.guestCurrent // empty')
+
+if [ -n "$ACT_CORES" ] && \
+   [ "$DES_CORES" = "$ACT_CORES" ] && \
+   [ "$DES_SOCKS" = "$ACT_SOCKS" ] && \
+   [ "$DES_THREADS" = "$ACT_THREADS" ] && \
+   [ -n "$ACT_MEM" ] && [ "$DES_MEM" = "$ACT_MEM" ]; then
+  echo LIVE_APPLIED_OK
+else
+  echo STILL_APPLYING
+fi
+
+
+Interpretation:
+
+RESTART_REQUIRED → call the restart API (you already tested).
+
+LIVE_APPLIED_OK → no reboot; proceed to next activity.
+
+STILL_APPLYING → keep polling for a short time; it may finish hot-plug. If it never matches and RestartRequired stays False, treat as “stuck” and alert.
+
+Do you need to compare with “user input”?
+
+Not strictly. The VM spec you GET is already the “desired” value (what Argo applied from Git). So:
+
+Compare VM spec (desired) vs VMI status (actual).
+
+Use VM condition RestartRequired as the authoritative “needs reboot” flag.
+
+This way your workflow doesn’t depend on what the caller said; it depends on what the cluster actually accepted and is running.
+
+If you don’t have jq in that shell, tell me which shell you’re using (CMD/PowerShell/minimal busybox), and I’ll give equivalent commands without jq.
