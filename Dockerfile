@@ -138,3 +138,146 @@ public class ResizeCheckRunner implements CommandLineRunner {
         System.out.println("=== Done ===");
     }
 }
+
+
+--------------------------------------
+------------------------------------
+
+package main.java.com.automation.fileuploader.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import javax.net.ssl.*;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+
+public class ResourceService {
+
+    // e.g. https://api.wh-ngcpntt1.svr.us.jpmchase.net:6443
+    private final String baseUrl;
+    // Bearer <token>
+    private final String token;
+    private final HttpClient http;
+    private final ObjectMapper om = new ObjectMapper();
+
+    public ResourceService(String baseUrl, String token) {
+        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+        this.token = token;
+        this.http = trustAllHttpClient();   // keep your -k style client
+    }
+
+    // ---------------- public API ----------------
+
+    /** GET /apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{vm} */
+    public JsonNode getVM(String ns, String vmName) throws Exception {
+        var url = baseUrl + "/apis/kubevirt.io/v1/namespaces/" + ns + "/virtualmachines/" + vmName;
+        return getJson(url);
+    }
+
+    /**
+     * GET /apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{vm}
+     * Returns null if VMI doesn't exist (VM not running).
+     */
+    public JsonNode getVMI(String ns, String vmName) throws Exception {
+        var url = baseUrl + "/apis/kubevirt.io/v1/namespaces/" + ns + "/virtualmachineinstances/" + vmName;
+        return getJsonOrNull(url);
+    }
+
+    /**
+     * POST /apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{vm}/restart
+     * Returns HTTP status code.
+     */
+    public int restartVM(String ns, String vmName) throws Exception {
+        var url = baseUrl + "/apis/subresources.kubevirt.io/v1/namespaces/" + ns + "/virtualmachines/" + vmName + "/restart";
+
+        var req = baseRequest(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString("{}"))   // <-- required empty JSON body
+            .build();
+
+        var res = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (res.statusCode() / 100 != 2) {
+            // Bubble up useful diagnostics (403 RBAC, 404 path, 409 state, 415/406 headers, etc.)
+            throw new IOException("Restart failed: HTTP " + res.statusCode()
+                + " -- " + safeK8sStatus(res.body()) + " (url=" + url + ")");
+        }
+        return res.statusCode();
+    }
+
+    // ---------------- helpers ----------------
+
+    private JsonNode getJson(String url) throws Exception {
+        var req = baseRequest(url).GET().build();
+        var res = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (res.statusCode() / 100 != 2) {
+            throw new IOException("GET failed: HTTP " + res.statusCode()
+                + " (url=" + url + ") -- " + safeK8sStatus(res.body()));
+        }
+        return om.readTree(res.body());
+    }
+
+    /** GET that returns null on 404 (useful for VMI not running). */
+    private JsonNode getJsonOrNull(String url) throws Exception {
+        var req = baseRequest(url).GET().build();
+        var res = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (res.statusCode() == 404) return null;
+        if (res.statusCode() / 100 != 2) {
+            throw new IOException("GET failed: HTTP " + res.statusCode()
+                + " (url=" + url + ") -- " + safeK8sStatus(res.body()));
+        }
+        return om.readTree(res.body());
+    }
+
+    private HttpRequest.Builder baseRequest(String url) {
+        return HttpRequest.newBuilder(URI.create(url))
+            .timeout(Duration.ofSeconds(15))
+            .header("Authorization", "Bearer " + token);
+    }
+
+    /** Parse a Kubernetes Status object if present, otherwise return trimmed body. */
+    private String safeK8sStatus(String body) {
+        try {
+            JsonNode n = om.readTree(body);
+            if (n.has("kind") && "Status".equals(n.get("kind").asText())) {
+                var reason = n.has("reason") ? n.get("reason").asText() : "";
+                var msg = n.has("message") ? n.get("message").asText() : "";
+                return ("reason=" + reason + ", message=" + msg).trim();
+            }
+        } catch (Exception ignore) { /* not JSON */ }
+        return body != null ? body.substring(0, Math.min(300, body.length())).replaceAll("\\s+", " ") : "";
+    }
+
+    /** Tiny 'trust-all' client (lab only – mirrors curl -k). */
+    private static HttpClient trustAllHttpClient() {
+        try {
+            TrustManager[] trustAll = new TrustManager[]{
+                new X509TrustManager() {
+                    public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[]{}; }
+                    public void checkClientTrusted(java.security.cert.X509Certificate[] xcs, String s) {}
+                    public void checkServerTrusted(java.security.cert.X509Certificate[] xcs, String s) {}
+                }
+            };
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(null, trustAll, new java.security.SecureRandom());
+
+            return HttpClient.newBuilder()
+                .sslContext(sc)
+                .sslParameters(new SSLParameters() {{
+                    setEndpointIdentificationAlgorithm(null); // disable hostname verification
+                }})
+                .version(HttpClient.Version.HTTP_1_1)
+                .build();
+        } catch (NoSuchAlgorithmException | KeyManagementException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
