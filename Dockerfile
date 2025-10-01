@@ -281,3 +281,23 @@ public class ResourceService {
     }
 }
 
+
+---------------------
+public int restartVM(String ns, String vmName) throws Exception {
+    String url = baseUrl + "/apis/subresources.kubevirt.io/v1/namespaces/"
+               + ns + "/virtualmachines/" + vmName + "/restart";
+
+    HttpRequest req = baseRequest(url)
+        .header("Content-Type", "application/json")
+        // .header("Accept", "application/json")  // REMOVE to avoid 406
+        .PUT(HttpRequest.BodyPublishers.ofString("{}"))
+        .build();
+
+    HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+    if (res.statusCode() / 100 != 2) {
+        throw new IOException("Restart failed: HTTP " + res.statusCode()
+            + " -- " + safeK8sStatus(res.body()) + " (url=" + url + ")");
+    }
+    return res.statusCode();
+}
+
