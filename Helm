@@ -202,3 +202,60 @@ Use VM condition RestartRequired as the authoritative “needs reboot” flag.
 This way your workflow doesn’t depend on what the caller said; it depends on what the cluster actually accepted and is running.
 
 If you don’t have jq in that shell, tell me which shell you’re using (CMD/PowerShell/minimal busybox), and I’ll give equivalent commands without jq.
+❌ Steps Missing or Not Fully Elaborated in Description
+
+From your updated flow, these new steps need to be included in the Confluence description to match the image:
+
+1. Host Record Creation (Active Directory)
+
+Create an AD Host object associated with the new VM.
+
+Ensures authentication, policy application, and identity integration.
+
+
+
+2. Get OpenShift VM Status
+
+Explicitly check the VM deployment status in OpenShift after ArgoCD sync.
+
+Confirms the VM object is in “Running” state.
+
+Earlier I only mentioned this under Monitoring, but it should be its own step.
+
+
+
+3. Ansible Playbook Status
+
+Execute Ansible playbooks against the new VM for configuration management.
+
+Example: install base packages, configure OS settings, set security policies.
+
+Workflow must wait for playbook completion and collect results.
+
+
+
+4. Ansible Log Review
+
+Capture logs from Ansible execution.
+
+Helps validate whether all configuration tasks were successful or if errors occurred.
+
+
+
+5. Provision the PLM Record
+
+Create/update record in Product Lifecycle Management (PLM) system.
+
+Ensures traceability, compliance, and lifecycle tracking of the VM.
+
+
+
+6. Perform Callback (not in the earlier text)
+
+Send a final callback to the requesting system or user (API/webhook).
+
+Confirms the VM has been fully provisioned and configured.
+
+Returns workflow status and reference IDs.
+
+
