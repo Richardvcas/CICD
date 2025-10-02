@@ -1,303 +1,297 @@
-package main.java.com.automation.kubevirt;
+Got it 👍 Richard. Let’s make this VM Pave Temporal Workflow Confluence page more professional by adding explanations under each step — so it’s not just API request/response, but also describes why the step is needed, what happens internally, and what the outcome is.
 
-import com.fasterxml.jackson.databind.JsonNode;
+Here’s the enhanced version with detailed elaboration 👇
 
-/** Decides restart by comparing user-requested values vs desired VM spec, and checks RestartRequired condition. */
-public class VmRestartPlanner {
 
-    public static class Result {
-        public final boolean desiredMatchesUser;
-        public final boolean restartRequired;
-        public Result(boolean desiredMatchesUser, boolean restartRequired) {
-            this.desiredMatchesUser = desiredMatchesUser;
-            this.restartRequired = restartRequired;
-        }
-    }
+---
 
-    /** return desiredMatchesUser + restartRequired flags (no VMI involved) */
-    public Result evaluate(JsonNode vm, int userVcpu, String userMemQty) {
-        int desiredVcpu = extractVcpuFromVM(vm);
-        long desiredMemMi = extractMemMiFromVM(vm);
-        long userMemMi = parseQtyMi(userMemQty);
+VM Pave Temporal Workflow
 
-        boolean matches = (desiredVcpu == userVcpu) && (desiredMemMi == userMemMi);
-        boolean restartNeeded = hasRestartRequiredTrue(vm);
+1. Overview
 
-        return new Result(matches, restartNeeded);
-    }
+This page describes the end-to-end workflow for VM Pave using Temporal, GitOps, and Argo CD.
+The workflow provisions a new Virtual Machine (VM) in OpenShift based on user-provided specifications.
 
-    /** true if VM.status.conditions has {type: "RestartRequired", status: "True"} */
-    public boolean hasRestartRequiredTrue(JsonNode vm) {
-        JsonNode conditions = vm.at("/status/conditions");
-        if (!conditions.isArray()) return false;
-        for (JsonNode c : conditions) {
-            String type = c.path("type").asText("");
-            String status = c.path("status").asText("");
-            if ("RestartRequired".equals(type) && "True".equalsIgnoreCase(status)) return true;
-        }
-        return false;
-    }
+Key Highlights:
 
-    // ---- desired (VM.spec) extractors ----
-    private int extractVcpuFromVM(JsonNode vm) {
-        JsonNode cpu = vm.at("/spec/template/spec/domain/cpu");
-        if (cpu.isMissingNode()) return 0;
-        int sockets = optInt(cpu.get("sockets"), 1);
-        int cores   = optInt(cpu.get("cores"), 1);
-        int threads = optInt(cpu.get("threads"), 1);
-        return sockets * cores * threads;
-    }
+Workflow orchestrated by Temporal
 
-    private long extractMemMiFromVM(JsonNode vm) {
-        // prefer resources.requests.memory, else domain.memory.guest
-        String mem = null;
-        var reqMem = vm.at("/spec/template/spec/domain/resources/requests/memory");
-        if (!reqMem.isMissingNode()) mem = reqMem.asText();
-        if (mem == null || mem.isBlank()) {
-            var guest = vm.at("/spec/template/spec/domain/memory/guest");
-            if (!guest.isMissingNode()) mem = guest.asText();
-        }
-        return parseQtyMi(mem);
-    }
+Inputs received via Swagger API request (JSON format)
 
-    // ---- utils ----
-    private int optInt(JsonNode n, int d) { return (n == null || n.isMissingNode()) ? d : n.asInt(d); }
+Activities executed in sequence for successful VM provisioning
 
-    /** Parse k8s quantity to Mi (supports Ki, Mi, Gi). */
-    private long parseQtyMi(String q) {
-        if (q == null || q.isBlank()) return 0;
-        q = q.trim().toUpperCase();
-        try {
-            if (q.endsWith("GI")) return Math.round(Double.parseDouble(q.replace("GI","").trim()) * 1024);
-            if (q.endsWith("MI")) return Math.round(Double.parseDouble(q.replace("MI","").trim()));
-            if (q.endsWith("KI")) return Math.round(Double.parseDouble(q.replace("KI","").trim()) / 1024);
-            // bare number → assume Mi for lab simplicity
-            return Math.round(Double.parseDouble(q));
-        } catch (Exception e) {
-            return 0;
-        }
-    }
+Deployment driven by Argo CD after YAML commit in Bitbucket
+
+
+
+---
+
+2. High-Level Workflow
+
+flowchart TD
+    A[User raises request via Swagger API] --> B[Validate Inputs]
+    B --> C[Hostname Generation]
+    C --> D[IP Reservation (NetID Service)]
+    D --> E[DNS Record Creation]
+    E --> F[YAML Upload to Bitbucket]
+    F --> G[ArgoCD Sync - VM Deployment in OpenShift]
+    G --> H[Sophia AD Account Creation]
+    H --> I[Veram Inventory Registration]
+    I --> J[VM Monitoring Check]
+
+
+---
+
+3. Workflow Steps in Detail
+
+Step 1: User Request via Swagger API
+
+The process begins when a user raises a VM provisioning request through the Swagger API.
+The request includes all required specifications such as CPU, memory, disk size, project ID, and owner details.
+Temporal immediately starts a new workflow instance, generating a unique workflowId to track the request.
+
+Request Example:
+
+
+{
+  "vmName": "wh-labocp-007",
+  "projectId": "gkp123",
+  "cpu": 4,
+  "memory": "16Gi",
+  "disk": "200Gi",
+  "region": "us-east-1",
+  "owner": "richard.xavier@company.com"
+}
+
+Response Example:
+
+
+{
+  "workflowId": "vm-pave-20250923-123456",
+  "status": "IN_PROGRESS",
+  "message": "VM Pave workflow triggered successfully"
 }
 
 
+---
 
--------------------------
+Step 2: Validate Inputs
 
-package main.java.com.automation.kubevirt.runner;
+This activity validates the incoming request.
+It ensures that all mandatory fields are present, values are within acceptable ranges, and project identifiers are valid.
+Without proper validation, downstream processes such as hostname or IP generation may fail.
 
-import com.fasterxml.jackson.databind.JsonNode;
-import main.java.com.automation.kubevirt.KubevirtApiService;
-import main.java.com.automation.kubevirt.VmRestartPlanner;
-import org.springframework.boot.CommandLineRunner;
-import org.springframework.context.annotation.Profile;
-import org.springframework.stereotype.Component;
+Request:
 
-@Component
-@Profile("resize-check")
-public class ResizeCheckRunner implements CommandLineRunner {
 
-    // ---- hardcode for demo (replace for your env) ----
-    private static final String API_SERVER = "https://api.wh-ngcpntt1.svr.us.jpmchase.net:6443";
-    private static final String TOKEN      = "eyJhbGciOi...<paste lab token>...";
-    private static final String NS         = "icpwforge";
-    private static final String VM_NAME    = "vmh02";
+{
+  "vmName": "wh-labocp-007",
+  "cpu": 4,
+  "memory": "16Gi"
+}
 
-    // ---- user-requested values (simulate request payload) ----
-    private static final int    REQ_VCPU   = 8;     // e.g., sockets*cores*threads total
-    private static final String REQ_MEMORY = "6Gi"; // k8s quantity string
+Response:
 
-    @Override
-    public void run(String... args) throws Exception {
-        System.out.println("=== ResizeCheckRunner (user-input vs desired + RestartRequired) ===");
 
-        var api = new KubevirtApiService(API_SERVER, TOKEN);
-        JsonNode vm = api.getVM(NS, VM_NAME);
-
-        var planner = new VmRestartPlanner();
-        var result  = planner.evaluate(vm, REQ_VCPU, REQ_MEMORY);
-
-        // Some prints to help your demo
-        System.out.println("[User Input] vCPU=" + REQ_VCPU + ", Mem=" + REQ_MEMORY);
-        System.out.println("[Desired.vm.spec.domain.cpu]   = " + vm.at("/spec/template/spec/domain/cpu").toString());
-        System.out.println("[Desired.requests.memory]      = " + vm.at("/spec/template/spec/domain/resources/requests/memory").asText(null));
-        System.out.println("[VM.status.conditions]         = " + vm.at("/status/conditions").toString());
-
-        if (!result.desiredMatchesUser) {
-            System.out.println("[SKIP] Desired spec != user input. Likely ArgoCD hasn’t applied yet. Not restarting.");
-            return;
-        }
-
-        if (result.restartRequired) {
-            System.out.println("[ACTION] Desired equals user input AND RestartRequired=True → posting restart...");
-            int code = api.restartVM(NS, VM_NAME);
-            System.out.println("[RESULT] restart HTTP status: " + code + (code/100==2 ? " (OK)" : " (check errors)"));
-        } else {
-            System.out.println("[OK] Desired equals user input but RestartRequired is not True → no restart.");
-        }
-
-        System.out.println("=== Done ===");
-    }
+{
+  "status": "VALID",
+  "message": "All inputs validated successfully"
 }
 
 
---------------------------------------
-------------------------------------
+---
 
-package main.java.com.automation.fileuploader.service;
+Step 3: Hostname Generation
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+A consistent hostname is required for DNS, AD, and inventory systems.
+The hostname generator follows corporate naming standards (region + project + sequence).
+This ensures uniqueness and alignment with infrastructure policies.
 
-import javax.net.ssl.*;
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.security.KeyManagementException;
-import java.security.NoSuchAlgorithmException;
-import java.time.Duration;
+Response:
 
-public class ResourceService {
 
-    // e.g. https://api.wh-ngcpntt1.svr.us.jpmchase.net:6443
-    private final String baseUrl;
-    // Bearer <token>
-    private final String token;
-    private final HttpClient http;
-    private final ObjectMapper om = new ObjectMapper();
-
-    public ResourceService(String baseUrl, String token) {
-        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
-        this.token = token;
-        this.http = trustAllHttpClient();   // keep your -k style client
-    }
-
-    // ---------------- public API ----------------
-
-    /** GET /apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{vm} */
-    public JsonNode getVM(String ns, String vmName) throws Exception {
-        var url = baseUrl + "/apis/kubevirt.io/v1/namespaces/" + ns + "/virtualmachines/" + vmName;
-        return getJson(url);
-    }
-
-    /**
-     * GET /apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{vm}
-     * Returns null if VMI doesn't exist (VM not running).
-     */
-    public JsonNode getVMI(String ns, String vmName) throws Exception {
-        var url = baseUrl + "/apis/kubevirt.io/v1/namespaces/" + ns + "/virtualmachineinstances/" + vmName;
-        return getJsonOrNull(url);
-    }
-
-    /**
-     * POST /apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{vm}/restart
-     * Returns HTTP status code.
-     */
-    public int restartVM(String ns, String vmName) throws Exception {
-        var url = baseUrl + "/apis/subresources.kubevirt.io/v1/namespaces/" + ns + "/virtualmachines/" + vmName + "/restart";
-
-        var req = baseRequest(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString("{}"))   // <-- required empty JSON body
-            .build();
-
-        var res = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (res.statusCode() / 100 != 2) {
-            // Bubble up useful diagnostics (403 RBAC, 404 path, 409 state, 415/406 headers, etc.)
-            throw new IOException("Restart failed: HTTP " + res.statusCode()
-                + " -- " + safeK8sStatus(res.body()) + " (url=" + url + ")");
-        }
-        return res.statusCode();
-    }
-
-    // ---------------- helpers ----------------
-
-    private JsonNode getJson(String url) throws Exception {
-        var req = baseRequest(url).GET().build();
-        var res = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (res.statusCode() / 100 != 2) {
-            throw new IOException("GET failed: HTTP " + res.statusCode()
-                + " (url=" + url + ") -- " + safeK8sStatus(res.body()));
-        }
-        return om.readTree(res.body());
-    }
-
-    /** GET that returns null on 404 (useful for VMI not running). */
-    private JsonNode getJsonOrNull(String url) throws Exception {
-        var req = baseRequest(url).GET().build();
-        var res = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (res.statusCode() == 404) return null;
-        if (res.statusCode() / 100 != 2) {
-            throw new IOException("GET failed: HTTP " + res.statusCode()
-                + " (url=" + url + ") -- " + safeK8sStatus(res.body()));
-        }
-        return om.readTree(res.body());
-    }
-
-    private HttpRequest.Builder baseRequest(String url) {
-        return HttpRequest.newBuilder(URI.create(url))
-            .timeout(Duration.ofSeconds(15))
-            .header("Authorization", "Bearer " + token);
-    }
-
-    /** Parse a Kubernetes Status object if present, otherwise return trimmed body. */
-    private String safeK8sStatus(String body) {
-        try {
-            JsonNode n = om.readTree(body);
-            if (n.has("kind") && "Status".equals(n.get("kind").asText())) {
-                var reason = n.has("reason") ? n.get("reason").asText() : "";
-                var msg = n.has("message") ? n.get("message").asText() : "";
-                return ("reason=" + reason + ", message=" + msg).trim();
-            }
-        } catch (Exception ignore) { /* not JSON */ }
-        return body != null ? body.substring(0, Math.min(300, body.length())).replaceAll("\\s+", " ") : "";
-    }
-
-    /** Tiny 'trust-all' client (lab only – mirrors curl -k). */
-    private static HttpClient trustAllHttpClient() {
-        try {
-            TrustManager[] trustAll = new TrustManager[]{
-                new X509TrustManager() {
-                    public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[]{}; }
-                    public void checkClientTrusted(java.security.cert.X509Certificate[] xcs, String s) {}
-                    public void checkServerTrusted(java.security.cert.X509Certificate[] xcs, String s) {}
-                }
-            };
-            SSLContext sc = SSLContext.getInstance("TLS");
-            sc.init(null, trustAll, new java.security.SecureRandom());
-
-            return HttpClient.newBuilder()
-                .sslContext(sc)
-                .sslParameters(new SSLParameters() {{
-                    setEndpointIdentificationAlgorithm(null); // disable hostname verification
-                }})
-                .version(HttpClient.Version.HTTP_1_1)
-                .build();
-        } catch (NoSuchAlgorithmException | KeyManagementException e) {
-            throw new RuntimeException(e);
-        }
-    }
+{
+  "hostname": "wh-labocp-007",
+  "fqdn": "wh-labocp-007.gkp123.dev.company.com"
 }
 
 
----------------------
-public int restartVM(String ns, String vmName) throws Exception {
-    String url = baseUrl + "/apis/subresources.kubevirt.io/v1/namespaces/"
-               + ns + "/virtualmachines/" + vmName + "/restart";
+---
 
-    HttpRequest req = baseRequest(url)
-        .header("Content-Type", "application/json")
-        // .header("Accept", "application/json")  // REMOVE to avoid 406
-        .PUT(HttpRequest.BodyPublishers.ofString("{}"))
-        .build();
+Step 4: IP Reservation
 
-    HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
-    if (res.statusCode() / 100 != 2) {
-        throw new IOException("Restart failed: HTTP " + res.statusCode()
-            + " -- " + safeK8sStatus(res.body()) + " (url=" + url + ")");
-    }
-    return res.statusCode();
+The workflow contacts the NetID IP Management service to reserve an IP address for the VM.
+The reservation ensures no duplication across the network and guarantees that the IP is available when the VM is deployed.
+This step is critical for networking and DNS mapping.
+
+Response:
+
+
+{
+  "ipAddress": "10.25.46.112",
+  "status": "RESERVED"
 }
+
+
+---
+
+Step 5: DNS Creation
+
+Once the IP is reserved, a DNS entry is created to map the hostname to the IP.
+This enables both internal and external services to resolve the VM using its Fully Qualified Domain Name (FQDN).
+If DNS fails, the VM cannot be accessed reliably.
+
+Response:
+
+
+{
+  "status": "SUCCESS",
+  "dnsRecord": "wh-labocp-007.gkp123.dev.company.com"
+}
+
+
+---
+
+Step 6: YAML Upload to Bitbucket
+
+After networking details are finalized, the workflow generates a values.yaml file containing the VM specifications.
+This YAML is pushed to the Bitbucket Git repository, which acts as the source of truth for GitOps.
+A commit triggers downstream ArgoCD sync automatically.
+
+Response:
+
+
+{
+  "status": "COMMITTED",
+  "repoUrl": "https://bitbucket.company.com/projects/vm-repo/wh-labocp-007"
+}
+
+
+---
+
+Step 7: Argo CD Sync (VM Deployment)
+
+ArgoCD continuously watches the Git repository.
+When the new YAML is committed, ArgoCD detects the change and syncs it with the OpenShift cluster.
+This results in a new VM object being created and deployed in the target namespace.
+
+Response Example:
+
+
+{
+  "status": "DEPLOYED",
+  "cluster": "ocp-lab1",
+  "namespace": "gkp123",
+  "vmStatus": "Running"
+}
+
+
+---
+
+Step 8: Sophia AD Creation
+
+To enable authentication and integration with enterprise services, a Sophia AD account is created for the VM.
+This ensures secure access and identity management.
+
+Response:
+
+
+{
+  "status": "SUCCESS",
+  "adAccount": "svc_wh-labocp-007"
+}
+
+
+---
+
+Step 9: Veram Inventory Registration
+
+The VM must be registered in Veram Inventory, which is the enterprise system for tracking IT assets.
+This step helps in auditing, compliance, and lifecycle management.
+
+Response:
+
+
+{
+  "status": "SUCCESS",
+  "inventoryId": "VERAM-343211"
+}
+
+
+---
+
+Step 10: VM Monitoring Check
+
+Finally, the VM is monitored to verify:
+
+Power state (Running)
+
+Network connectivity
+
+Health probes (CPU/memory thresholds, agent registration)
+
+
+This ensures the VM is fully functional before marking the workflow as SUCCESS.
+
+Response:
+
+
+{
+  "vmName": "wh-labocp-007",
+  "status": "RUNNING",
+  "healthCheck": "PASSED"
+}
+
+
+---
+
+4. Final Workflow Response
+
+Once all steps are complete, the final response is returned:
+
+{
+  "workflowId": "vm-pave-20250923-123456",
+  "vmName": "wh-labocp-007",
+  "fqdn": "wh-labocp-007.gkp123.dev.company.com",
+  "ipAddress": "10.25.46.112",
+  "status": "SUCCESS",
+  "message": "VM successfully provisioned"
+}
+
+
+---
+
+5. Key Integrations
+
+Step	Integration Service	Purpose
+
+Input Validation	Swagger + Temporal	Ensures correct request payload
+Hostname	Hostname Generator	Standardized naming
+IP Reservation	NetID	Unique IP allocation
+DNS	NetID DNS	Maps hostname to IP
+YAML Upload	Bitbucket	Source of truth for GitOps
+Deployment	ArgoCD	Syncs manifests to OpenShift
+AD Account	Sophia	Creates service accounts
+Inventory	Veram	Tracks VM assets
+Monitoring	Prometheus / Custom API	Ensures VM health
+
+
+
+---
+
+✅ Now this page is detailed enough to stand as a professional Confluence document — each step has both technical detail + business justification.
+
+Would you like me to now replicate the same detailed structure for:
+
+1. VM Resize Workflow
+
+
+2. VM Delete Workflow
+
+
+3. VM Repave Workflow
+
+
+
+so you’ll have a 4-page Confluence set with the same professional style?
 
